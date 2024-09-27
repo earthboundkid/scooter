@@ -19,6 +19,7 @@ import (
 	"github.com/carlmjohnson/flagx"
 	"github.com/carlmjohnson/versioninfo"
 	"github.com/progrium/darwinkit/macos/foundation"
+	"github.com/progrium/darwinkit/objc"
 )
 
 const AppName = "Scooter"
@@ -38,6 +39,7 @@ func CLI(args []string) error {
 func (app *appEnv) ParseArgs(args []string) error {
 	fl := flag.NewFlagSet(AppName, flag.ContinueOnError)
 	fl.StringVar(&app.dir, "dir", ".", "directory to read")
+	fl.BoolVar(&app.excludeDirs, "exclude-dirs", false, "don't move directories")
 	fl.BoolVar(&app.dryRun, "dry-run", false, "just output file locations without moving")
 	app.Logger = log.New(io.Discard, AppName+" ", log.LstdFlags)
 	flagx.BoolFunc(fl, "verbose", "log debug output", func() error {
@@ -67,8 +69,9 @@ Options:
 }
 
 type appEnv struct {
-	dir    string
-	dryRun bool
+	dir         string
+	excludeDirs bool
+	dryRun      bool
 	*log.Logger
 }
 
@@ -77,18 +80,18 @@ func (app *appEnv) Exec() (err error) {
 	if err != nil {
 		return err
 	}
-	var names []string
+	var paths []string
 	for _, entry := range entries {
 		name := entry.Name()
 		if entry.IsDir() || strings.HasPrefix(name, ".") {
 			continue
 		}
-		names = append(names, name)
+		path := filepath.Join(app.dir, name)
+		paths = append(paths, path)
 	}
 	type pair struct{ old, new string }
 	var pairs []pair
-	for _, name := range names {
-		path := filepath.Join(app.dir, name)
+	for _, path := range paths {
 		newname, err := buildName(path)
 		if err != nil {
 			return err
@@ -96,23 +99,27 @@ func (app *appEnv) Exec() (err error) {
 		pairs = append(pairs, pair{path, filepath.Join(app.dir, newname)})
 	}
 
-	var dirnames []string
-	for _, entry := range entries {
-		name := entry.Name()
-		if !entry.IsDir() || strings.HasPrefix(name, ".") ||
-			(len(name) == 4 && strings.HasPrefix(name, "20")) {
-			continue
+	if !app.excludeDirs {
+		var dirpaths []string
+		for _, entry := range entries {
+			name := entry.Name()
+			if !entry.IsDir() || strings.HasPrefix(name, ".") ||
+				(len(name) == 4 && strings.HasPrefix(name, "20")) {
+				continue
+			}
+			path := filepath.Join(app.dir, name)
+			dirpaths = append(dirpaths, path)
 		}
-		dirnames = append(dirnames, name)
-	}
-	for _, dirname := range dirnames {
-		path := filepath.Join(app.dir, dirname)
-		date, err := getDateAdded(path)
-		if err != nil {
-			return err
+		for _, dirpath := range dirpaths {
+			date, err := getDateAdded(dirpath)
+			if err != nil {
+				return err
+			}
+			name := filepath.Base(dirpath)
+			newname := date.Format("2006/01/") + name
+			newpath := filepath.Join(app.dir, newname)
+			pairs = append(pairs, pair{dirpath, newpath})
 		}
-		newname := date.Format("2006/01/") + dirname
-		pairs = append(pairs, pair{path, filepath.Join(app.dir, newname)})
 	}
 
 	// Sort by destination
@@ -149,22 +156,35 @@ func buildName(path string) (string, error) {
 	return fmt.Sprintf("%d/%02d/%s/%s", dateAdded.Year(), dateAdded.Month(), kind, name), nil
 }
 
-func getDateAdded(path string) (time.Time, error) {
-	var dateAdded foundation.Date
-	var err foundation.Error
+func getDateAdded(path string) (t time.Time, err error) {
+	var (
+		ok            bool
+		unixTimestamp float64
+	)
+	s := strings.Clone(path)
 
-	url := foundation.URL_FileURLWithPath(path)
-	if ok := url.GetResourceValueForKeyError(
-		unsafe.Pointer(&dateAdded),
-		foundation.URLAddedToDirectoryDateKey,
-		unsafe.Pointer(&err),
-	); !ok {
+	// Was getting random memory corruption,
+	// so let's try just throwing in a pool
+	objc.WithAutoreleasePool(func() {
+		var dateAdded foundation.Date
+		var err foundation.Error
+		url := foundation.NewURLFileURLWithPath(s)
+		ok = url.GetResourceValueForKeyError(
+			unsafe.Pointer(&dateAdded),
+			foundation.URLAddedToDirectoryDateKey,
+			unsafe.Pointer(&err),
+		)
+		if !ok {
+			return
+		}
+		unixTimestamp = float64(dateAdded.TimeIntervalSince1970())
+	})
+	if !ok {
 		return time.Time{}, fmt.Errorf("could not read %q", path)
 	}
 
-	unixTimestamp := dateAdded.TimeIntervalSince1970()
-	seconds := math.Floor(float64(unixTimestamp))
-	nanoseconds := (float64(unixTimestamp) - seconds) * 1e9
+	seconds := math.Floor(unixTimestamp)
+	nanoseconds := (unixTimestamp - seconds) * 1e9
 
 	return time.Unix(int64(seconds), int64(nanoseconds)), nil
 }
@@ -178,6 +198,7 @@ func getKind(name string) string {
 		"audio: aac m4a mp3 wav",
 		"data: csv json xls xlsx",
 		"doc: doc docx pages pdf rtf rtfd txt",
+		"book: epub",
 		"image: avif bmp gif heic jpg jpeg  png svg tif webp",
 		"video: avi mp4 mpeg",
 		"web: css html ico js sass",
